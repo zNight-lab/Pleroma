@@ -1,93 +1,149 @@
-#!/usr/bin/env bash
-# Silent Low-RAM Pleroma Installer (<512MB RAM, 2 CPU)
-# Fully automated, no user input
+#!/usr/bin/env python3
+from flask import Flask, request, render_template_string, redirect, url_for, Response
+import os
+import subprocess
+import psutil
+from datetime import datetime
+from functools import wraps
 
-set -e
+# ---------------- CONFIG ----------------
+CONFIG_FILE = os.path.expanduser("~/pleroma/config/prod.secret.exs")
+PLEROMA_SERVICE = "pleroma"
 
-# --- Variables ---
-PLEROMA_USER=pleroma
-PLEROMA_HOME=/home/$PLEROMA_USER
-PLEROMA_REPO=https://git.pleroma.social/pleroma/pleroma.git
-POSTGRES_PASSWORD=$(openssl rand -base64 12)
-BANNED_WORDS=("nsfw" "porn" "hentai" "18+" "lewd" "nude" "erotic")
+# Set your login credentials here
+AUTH_USER = "admin"
+AUTH_PASS = "your_secret_key"
 
-echo "=== Installing system packages ==="
-sudo apt update -qq
-sudo apt install -yqq git libmagic-dev build-essential cmake erlang-dev libssl-dev \
-libncurses5-dev libcurl4-openssl-dev libexpat1-dev libxml2-dev \
-postgresql postgresql-contrib redis-server wget curl
+# ---------------- FLASK APP ----------------
+app = Flask(__name__)
 
-echo "=== Creating pleroma user ==="
-id -u $PLEROMA_USER &>/dev/null || sudo useradd -m -d $PLEROMA_HOME -s /bin/bash $PLEROMA_USER
+# Basic Auth decorator
+def check_auth(username, password):
+    return username == AUTH_USER and password == AUTH_PASS
 
-echo "=== Setting up PostgreSQL ==="
-sudo -u postgres psql -c "CREATE USER $PLEROMA_USER WITH PASSWORD '$POSTGRES_PASSWORD';" || true
-sudo -u postgres psql -c "CREATE DATABASE pleroma OWNER $PLEROMA_USER;" || true
+def authenticate():
+    return Response(
+        'Login Required', 401,
+        {'WWW-Authenticate': 'Basic realm="Login Required"'}
+    )
 
-echo "=== Cloning Pleroma repo ==="
-sudo -u $PLEROMA_USER git clone $PLEROMA_REPO $PLEROMA_HOME/pleroma || true
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    return decorated
 
-cd $PLEROMA_HOME/pleroma
+# ---------------- HELPER FUNCTIONS ----------------
+def read_config():
+    banned_words = []
+    host = ""
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            for line in f:
+                if "prohibited_words" in line:
+                    banned_words = line.split('=')[1].strip().replace('[','').replace(']','').replace('"','').split()
+                if "host:" in line:
+                    host = line.split(":")[1].strip().replace('"','')
+    return banned_words, host
 
-echo "=== Installing Hex & Rebar ==="
-sudo -u $PLEROMA_USER mix local.hex --force
-sudo -u $PLEROMA_USER mix local.rebar --force
+def write_config(banned_words, host):
+    lines = []
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            for line in f:
+                if "prohibited_words" in line:
+                    lines.append(f"  prohibited_words: {banned_words}\n")
+                elif "host:" in line:
+                    lines.append(f'  host: "{host}"\n')
+                else:
+                    lines.append(line)
+        with open(CONFIG_FILE, "w") as f:
+            f.writelines(lines)
 
-echo "=== Fetching and compiling dependencies ==="
-sudo -u $PLEROMA_USER MIX_ENV=prod mix deps.get --only prod --force
-sudo -u $PLEROMA_USER MIX_ENV=prod mix deps.compile
-sudo -u $PLEROMA_USER MIX_ENV=prod mix compile
-sudo -u $PLEROMA_USER MIX_ENV=prod mix release
+def run_systemctl(action):
+    subprocess.run(["sudo", "systemctl", action, PLEROMA_SERVICE], check=True)
 
-echo "=== Creating production config ==="
-sudo -u $PLEROMA_USER mkdir -p $PLEROMA_HOME/pleroma/config
-CONFIG_FILE=$PLEROMA_HOME/pleroma/config/prod.secret.exs
+def update_pleroma():
+    pleroma_home = os.path.expanduser("~/pleroma")
+    subprocess.run(["git", "-C", pleroma_home, "pull"], check=True)
+    subprocess.run(["mix", "deps.get", "--only", "prod"], cwd=pleroma_home, check=True)
+    subprocess.run(["mix", "deps.compile"], cwd=pleroma_home, check=True)
+    subprocess.run(["mix", "compile"], cwd=pleroma_home, check=True)
+    subprocess.run([f"{pleroma_home}/_build/prod/rel/pleroma/bin/pleroma", "stop"], cwd=pleroma_home, check=True)
+    subprocess.run([f"{pleroma_home}/_build/prod/rel/pleroma/bin/pleroma", "start"], cwd=pleroma_home, check=True)
 
-sudo -u $PLEROMA_USER tee $CONFIG_FILE > /dev/null <<EOL
-use Mix.Config
+def service_status():
+    try:
+        output = subprocess.check_output(["systemctl", "is-active", PLEROMA_SERVICE]).decode().strip()
+        return output
+    except:
+        return "unknown"
 
-config :pleroma, Pleroma.Repo,
-  database: "pleroma",
-  username: "$PLEROMA_USER",
-  password: "$POSTGRES_PASSWORD",
-  hostname: "localhost",
-  pool_size: 5  # Low RAM optimization
+def system_usage():
+    mem = psutil.virtual_memory()
+    cpu = psutil.cpu_percent(interval=0.5)
+    return cpu, mem.percent
 
-config :pleroma, :instance,
-  host: "$(hostname -I | awk '{print \$1}')",
-  prohibited_words: ${BANNED_WORDS[@]}
-EOL
+# ---------------- HTML TEMPLATE ----------------
+HTML = """
+<!doctype html>
+<title>Pleroma Admin GUI</title>
+<meta http-equiv="refresh" content="5">
+<h2>Pleroma Admin Dashboard</h2>
 
-echo "=== Applying database migrations ==="
-sudo -u $PLEROMA_USER MIX_ENV=prod mix ecto.migrate
+<p><b>Service Status:</b> {{status}}</p>
+<p><b>CPU Usage:</b> {{cpu}}% | <b>RAM Usage:</b> {{ram}}%</p>
+<p><b>Last Update:</b> {{last_update}}</p>
 
-echo "=== Deploying assets ==="
-sudo -u $PLEROMA_USER MIX_ENV=prod mix assets.deploy
+<form method=post>
+Instance Host: <input name=host value="{{host}}"><br><br>
+Banned Words (space-separated): <input name=bw value="{{bw}}"><br><br>
+<input type=submit name=action value="Save Config">
+<input type=submit name=action value="Restart Pleroma">
+<input type=submit name=action value="Update & Restart">
+</form>
 
-echo "=== Creating systemd service ==="
-sudo tee /etc/systemd/system/pleroma.service > /dev/null <<EOL
-[Unit]
-Description=Pleroma social server
-After=network.target
+<p>Page auto-refreshes every 5 seconds.</p>
+"""
 
-[Service]
-Type=simple
-User=$PLEROMA_USER
-WorkingDirectory=$PLEROMA_HOME/pleroma
-ExecStart=$PLEROMA_HOME/pleroma/_build/prod/rel/pleroma/bin/pleroma start
-ExecStop=$PLEROMA_HOME/pleroma/_build/prod/rel/pleroma/bin/pleroma stop
-Restart=always
+# ---------------- ROUTES ----------------
+@app.route("/", methods=["GET","POST"])
+@requires_auth
+def gui():
+    banned_words, host = read_config()
+    last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    status = service_status()
+    cpu, ram = system_usage()
+    
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "Save Config":
+            bw = request.form.get("bw","").split()
+            host = request.form.get("host", host)
+            write_config(bw, host)
+        elif action == "Restart Pleroma":
+            run_systemctl("restart")
+        elif action == "Update & Restart":
+            update_pleroma()
+        return redirect(url_for("gui"))
+    
+    banned_words, host = read_config()
+    status = service_status()
+    cpu, ram = system_usage()
+    
+    return render_template_string(
+        HTML, 
+        bw=" ".join(banned_words), 
+        host=host,
+        status=status,
+        cpu=cpu,
+        ram=ram,
+        last_update=last_update
+    )
 
-[Install]
-WantedBy=multi-user.target
-EOL
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now pleroma
-
-echo "=== Installation complete! ==="
-echo "Server IP: $(hostname -I | awk '{print $1}')"
-echo "Pleroma is running on http://$(hostname -I | awk '{print $1}'):4000"
-echo "PostgreSQL user: $PLEROMA_USER"
-echo "PostgreSQL password: $POSTGRES_PASSWORD"
-echo "View logs: sudo journalctl -u pleroma -f"
+# ---------------- MAIN ----------------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
