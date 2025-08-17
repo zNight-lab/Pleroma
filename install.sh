@@ -1,116 +1,93 @@
 #!/usr/bin/env bash
-# Fully automated Pleroma installer for Debian/Ubuntu
-# Production-ready, low-RAM optimized
-# No Docker, no YunoHost required
+# Silent Low-RAM Pleroma Installer (<512MB RAM, 2 CPU)
+# Fully automated, no user input
 
 set -e
 
-echo "🚀 Starting Pleroma installation..."
+# --- Variables ---
+PLEROMA_USER=pleroma
+PLEROMA_HOME=/home/$PLEROMA_USER
+PLEROMA_REPO=https://git.pleroma.social/pleroma/pleroma.git
+POSTGRES_PASSWORD=$(openssl rand -base64 12)
+BANNED_WORDS=("nsfw" "porn" "hentai" "18+" "lewd" "nude" "erotic")
 
-# --- Detect VPS IP ---
-INSTANCE_DOMAIN=$(curl -s http://ipinfo.io/ip)
-INSTANCE_NAME="Pleroma Auto"
-PLEROMA_USER="pleroma"
-PLEROMA_HOME="/home/$PLEROMA_USER"
-PG_PASSWORD=$(openssl rand -hex 12)
+echo "=== Installing system packages ==="
+sudo apt update -qq
+sudo apt install -yqq git libmagic-dev build-essential cmake erlang-dev libssl-dev \
+libncurses5-dev libcurl4-openssl-dev libexpat1-dev libxml2-dev \
+postgresql postgresql-contrib redis-server wget curl
 
-# --- Ask user for optional banned words ---
-read -p "Do you want to add banned words filter? (y/N): " USE_BANNED
-if [[ "$USE_BANNED" =~ ^[Yy]$ ]]; then
-    read -p "Enter banned words as comma-separated list (example: nsfw,porn,hentai): " BANNED_INPUT
-    IFS=',' read -ra WORDS <<< "$BANNED_INPUT"
-    BANNED_WORDS="["
-    for w in "${WORDS[@]}"; do
-        BANNED_WORDS="$BANNED_WORDS\"$w\","
-    done
-    BANNED_WORDS="${BANNED_WORDS%,}]"
-else
-    BANNED_WORDS="[]"
-fi
+echo "=== Creating pleroma user ==="
+id -u $PLEROMA_USER &>/dev/null || sudo useradd -m -d $PLEROMA_HOME -s /bin/bash $PLEROMA_USER
 
-echo "Detected VPS IP: $INSTANCE_DOMAIN"
-
-# --- Install dependencies ---
-sudo apt update
-sudo apt install -y git build-essential postgresql postgresql-contrib \
-    redis-server elixir erlang libssl-dev libncurses5-dev libcurl4-openssl-dev \
-    libpq-dev nodejs npm curl
-
-# --- Create Pleroma system user ---
-sudo adduser --disabled-login --gecos "Pleroma User" $PLEROMA_USER || true
-
-# --- Setup PostgreSQL ---
-sudo -u postgres psql -c "CREATE USER $PLEROMA_USER WITH PASSWORD '$PG_PASSWORD';" || true
+echo "=== Setting up PostgreSQL ==="
+sudo -u postgres psql -c "CREATE USER $PLEROMA_USER WITH PASSWORD '$POSTGRES_PASSWORD';" || true
 sudo -u postgres psql -c "CREATE DATABASE pleroma OWNER $PLEROMA_USER;" || true
 
-# --- Clone Pleroma repo ---
-sudo -u $PLEROMA_USER git clone https://git.pleroma.social/pleroma/pleroma.git $PLEROMA_HOME/pleroma
+echo "=== Cloning Pleroma repo ==="
+sudo -u $PLEROMA_USER git clone $PLEROMA_REPO $PLEROMA_HOME/pleroma || true
 
-# --- Configure production settings ---
-sudo -u $PLEROMA_USER bash <<EOF
 cd $PLEROMA_HOME/pleroma
-cp config/dev.secret.exs config/prod.secret.exs
 
-cat > config/prod.secret.exs <<EOC
+echo "=== Installing Hex & Rebar ==="
+sudo -u $PLEROMA_USER mix local.hex --force
+sudo -u $PLEROMA_USER mix local.rebar --force
+
+echo "=== Fetching and compiling dependencies ==="
+sudo -u $PLEROMA_USER MIX_ENV=prod mix deps.get --only prod --force
+sudo -u $PLEROMA_USER MIX_ENV=prod mix deps.compile
+sudo -u $PLEROMA_USER MIX_ENV=prod mix compile
+sudo -u $PLEROMA_USER MIX_ENV=prod mix release
+
+echo "=== Creating production config ==="
+sudo -u $PLEROMA_USER mkdir -p $PLEROMA_HOME/pleroma/config
+CONFIG_FILE=$PLEROMA_HOME/pleroma/config/prod.secret.exs
+
+sudo -u $PLEROMA_USER tee $CONFIG_FILE > /dev/null <<EOL
 use Mix.Config
 
-config :pleroma, Pleroma.Web.Endpoint,
-  http: [ip: {0,0,0,0}, port: 4000],
-  url: [host: "$INSTANCE_DOMAIN", scheme: "http"],
-  secret_key_base: "$(openssl rand -hex 64)"
+config :pleroma, Pleroma.Repo,
+  database: "pleroma",
+  username: "$PLEROMA_USER",
+  password: "$POSTGRES_PASSWORD",
+  hostname: "localhost",
+  pool_size: 5  # Low RAM optimization
 
 config :pleroma, :instance,
-  name: "$INSTANCE_NAME",
-  description: "Automated low-RAM Pleroma instance",
-  limit: 50_000
+  host: "$(hostname -I | awk '{print \$1}')",
+  prohibited_words: ${BANNED_WORDS[@]}
+EOL
 
-config :pleroma, Pleroma.Repo,
-  username: "$PLEROMA_USER",
-  password: "$PG_PASSWORD",
-  database: "pleroma",
-  hostname: "localhost"
+echo "=== Applying database migrations ==="
+sudo -u $PLEROMA_USER MIX_ENV=prod mix ecto.migrate
 
-config :pleroma, Pleroma.Moderation,
-  banned_words: $BANNED_WORDS
-EOC
-EOF
+echo "=== Deploying assets ==="
+sudo -u $PLEROMA_USER MIX_ENV=prod mix assets.deploy
 
-# --- Build Pleroma ---
-sudo -u $PLEROMA_USER bash <<EOF
-cd $PLEROMA_HOME/pleroma
-mix deps.get --only prod
-MIX_ENV=prod mix compile
-MIX_ENV=prod mix release
-EOF
-
-# --- Setup systemd service ---
-sudo tee /etc/systemd/system/pleroma.service > /dev/null <<EOC
+echo "=== Creating systemd service ==="
+sudo tee /etc/systemd/system/pleroma.service > /dev/null <<EOL
 [Unit]
-Description=Pleroma
-After=network.target postgresql.service redis-server.service
+Description=Pleroma social server
+After=network.target
 
 [Service]
 Type=simple
 User=$PLEROMA_USER
 WorkingDirectory=$PLEROMA_HOME/pleroma
 ExecStart=$PLEROMA_HOME/pleroma/_build/prod/rel/pleroma/bin/pleroma start
+ExecStop=$PLEROMA_HOME/pleroma/_build/prod/rel/pleroma/bin/pleroma stop
 Restart=always
-Environment=MIX_ENV=prod
 
 [Install]
 WantedBy=multi-user.target
-EOC
+EOL
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now pleroma
 
-echo "✅ Pleroma installed successfully!"
-echo "Instance URL: http://$INSTANCE_DOMAIN:4000"
+echo "=== Installation complete! ==="
+echo "Server IP: $(hostname -I | awk '{print $1}')"
+echo "Pleroma is running on http://$(hostname -I | awk '{print $1}'):4000"
 echo "PostgreSQL user: $PLEROMA_USER"
-echo "PostgreSQL password: $PG_PASSWORD"
-if [[ "$USE_BANNED" =~ ^[Yy]$ ]]; then
-    echo "Banned words filter active: $BANNED_INPUT"
-else
-    echo "No banned words filter applied"
-fi
-echo "Use 'journalctl -u pleroma -f' to view server logs"
+echo "PostgreSQL password: $POSTGRES_PASSWORD"
+echo "View logs: sudo journalctl -u pleroma -f"
